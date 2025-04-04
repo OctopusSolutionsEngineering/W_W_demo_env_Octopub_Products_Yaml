@@ -1,0 +1,145 @@
+name = "Switch to AWS"
+default_guided_failure_mode = "EnvironmentDefault"
+description = "Change Cloud Discovery to AWS."
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+}
+
+process {
+    step "get-rds-endpoint" {
+        name = "Get RDS endpoint"
+
+        action {
+            action_type = "Octopus.AwsRunScript"
+            properties = {
+                Octopus.Action.Aws.AssumeRole = "False"
+                Octopus.Action.Aws.Region = "#{AWS.Region}"
+                Octopus.Action.AwsAccount.UseInstanceRole = "True"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    # Get region
+                    $awsRegion = $OctopusParameters['AWS.Region']
+                    
+                    Write-Host "Selected region is: $awsRegion"
+                    
+                    # Get reference to the instance
+                    $databaseInstances = (aws rds describe-db-instances --region "$awsRegion") | ConvertFrom-JSON
+                     
+                    # Get MariaDB instance
+                    $databaseInstance = $databaseInstances.DBInstances | Where-Object {$_.DBInstanceIdentifier -eq "demo-mysql"}
+                    
+                    # Set the output variable
+                    Write-Host "Setting output variable AWS.RDS.Endpoint.Address to $($databaseInstance.Endpoint.Address)"
+                    Set-OctopusVariable -name "AWS.RDS.EndPoint.Address" -value $databaseInstance.Endpoint.Address
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool = "aws-worker-pool"
+
+            container {
+                feed = "docker-hub"
+                image = "octopuslabs/aws-workertools"
+            }
+        }
+    }
+
+    step "update-variables" {
+        name = "Update variables"
+
+        action {
+            action_type = "Octopus.Script"
+            properties = {
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    if ($PSEdition -eq "Core") {
+                        $PSStyle.OutputRendering = "PlainText"
+                    }
+                    
+                    $octopusURL = "https://demo.octopus.app"
+                    $octopusAPIKey = $OctopusParameters["Global.Octopus.ApiKey"]
+                    
+                    ##PROCESS
+                    $header = @{ "X-Octopus-ApiKey" = $octopusAPIKey }
+                    
+                    $spaceId = $OctopusParameters["Octopus.Space.Id"]
+                    $projectId = $OctopusParameters["Octopus.Project.Id"]
+                    
+                    $space = Invoke-RestMethod -Method Get -Uri "$octopusURL/api/spaces/$spaceId" -Headers $header
+                    $project = Invoke-RestMethod -Method Get -Uri "$octopusURL/api/$spaceId/projects/$projectId" -Headers $header
+                    $projectVariables = Invoke-RestMethod -Method Get -Uri "$octopusURL/api/$spaceId/projects/$projectId/variables" -Headers $header
+                    $workerPools = Invoke-Restmethod -Method Get -Uri "$octopusURL/api/$spaceId/workerpools/all" -Headers $header
+                    
+                    $projectDeploymentProcess = Invoke-RestMethod -Method Get -Uri "$octopusURL/api/$spaceId/projects/$projectId/deploymentprocesses" -Headers $header
+                    
+                    $workerPool = ($workerPools | Where-Object {$_.Name -eq "AWS Worker Pool"})
+                    
+                    # Get worker pool variable
+                    $workerPoolVariable = $projectVariables.Variables | Where-Object {$_.Name -eq "Project.Worker.Pool"}
+                    
+                    # Update the worker pool variable
+                    $workerPoolVariable.Value = $workerPool.Id
+                    
+                    # Get database server variable
+                    $databaseServer = $projectVariables.Variables | Where-Object {$_.Name -eq "Project.Database.Server.Name"}
+                    $databaseServer.Value = $OctopusParameters['Octopus.Action[Get RDS endpoint].Output.AWS.RDS.Endpoint.Address']
+                    
+                    ($projectVariables.Variables | Where-Object {$_.Name -eq "Project.Database.Server.User"}).Value = "#{AWS.RDS.Admin.Username}"
+                    ($projectVariables.Variables | Where-Object {$_.Name -eq "Project.Database.Server.Password"}).Value = $OctopusParameters['AWS.RDS.Admin.Password']
+                    
+                    # Remove required Azure variable
+                    $projectVariables.Variables = ($projectVariables.Variables | Where-Object {$_.Name -ne "Octopus.Azure.Account"})
+                    
+                    # Get ID for step two
+                    $deploymentStep = ($projectDeploymentProcess.Steps | Where-Object {$_.Name -eq "Create namespace if not exists"})
+                    
+                    # Add required AWS variable
+                    $variable = @{
+                        Name = "Octopus.Aws.Regions"
+                        Value = "#{AWS.Region}"
+                        Type = "String"
+                        IsSensitive = $false
+                        Scope = @{
+                        	Action = @(
+                            	$deploymentStep.Actions[0].Id
+                            )
+                        }    
+                    }
+                    
+                    $variableToUpdate = New-Object -TypeName PSObject
+                    $variableToUpdate | Add-Member -MemberType NoteProperty -Name "Name" -Value $variable.Name
+                    $variableToUpdate | Add-Member -MemberType NoteProperty -Name "Value" -Value $variable.Value
+                    $variableToUpdate | Add-Member -MemberType NoteProperty -Name "Type" -Value $variable.Type
+                    $variableToUpdate | Add-Member -MemberType NoteProperty -Name "IsSensitive" -Value $variable.IsSensitive
+                    $variableToUpdate | Add-Member -MemberType NoteProperty -Name "Scope" -Value $variable.Scope
+                    
+                    # Add to collection
+                    $projectVariables.Variables += $variableToUpdate
+                    
+                    # Update the variables
+                    Invoke-RestMethod -Method Put -Uri "$octopusURL/api/spaces/$spaceId/projects/$projectId/variables" -Body ($projectVariables | ConvertTo-Json -Depth 10) -Headers $header
+                    
+                    # Deregister AKS clusters
+                    $k8sTargets = Invoke-RestMethod -Method Get -Uri "$octopusURL/api/spaces/$spaceId/machines?deploymentTargetTypes=Kubernetes" -Headers $header
+                    $workerPool = ($workerPools | Where-Object {$_.Name -eq "Azure Worker Pool"})
+                    
+                    foreach ($target in $k8sTargets.Items)
+                    {
+                    	if ($target.Endpoint.DefaultWorkerPoolId -eq $workerPool.Id -and $target.Name.Contains("aks/"))
+                        {
+                        	Write-Host "Deregistering target $($target.Name)"
+                            Invoke-RestMethod -Method Delete -Uri "$octopusURL/api/spaces/$spaceId/machines/$($target.Id)" -Headers $header
+                        }
+                    }
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "PowerShell"
+            }
+            worker_pool = "hosted-ubuntu"
+        }
+    }
+}

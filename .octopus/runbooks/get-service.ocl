@@ -1,0 +1,52 @@
+name = "🛠️ Describe Service"
+description = <<-EOT
+        **Action**: Returns the services.
+        
+        **Affects**: Nothing - this runbook makes no changes.
+        EOT
+environment_scope = "FromProjectLifecycles"
+
+connectivity_policy {
+    allow_deployments_to_no_targets = true
+}
+
+run_retention_policy {
+    quantity_to_keep = 3
+}
+
+process {
+    step "get-service" {
+        name = "Describe Service"
+        properties = {
+            Octopus.Action.TargetRoles = "octopub"
+        }
+
+        action "describe-service" {
+            action_type = "Octopus.KubernetesRunScript"
+            properties = {
+                K8SInspectCreateArtifact = "False"
+                K8SInspectKubectlVerb = "get"
+                K8SInspectNames = "#{Kubernetes.Service.Name}*"
+                K8SInspectResource = "service"
+                Octopus.Action.KubernetesContainers.Namespace = "#{Octopub.Yaml.Cluster.Namespace}"
+                Octopus.Action.Script.ScriptBody = <<-EOT
+                    component=$(get_octopusvariable "Project.Labels.Component")
+                    kubectl describe service -l component=$component > $PWD/service.txt
+                    
+                    new_octopusartifact $PWD/service.txt service.txt
+                    
+                    cat $PWD/service.txt
+                    EOT
+                Octopus.Action.Script.ScriptSource = "Inline"
+                Octopus.Action.Script.Syntax = "Bash"
+                OctopusUseBundledTooling = "False"
+            }
+            worker_pool = "hosted-ubuntu"
+
+            container {
+                feed = "docker-hub"
+                image = "octopuslabs/k8s-workertools"
+            }
+        }
+    }
+}
